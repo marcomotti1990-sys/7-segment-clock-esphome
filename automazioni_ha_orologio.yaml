@@ -1,0 +1,104 @@
+# ==============================================================================
+# Automazioni Home Assistant per Orologio 7 Segmenti (ESPHome)
+# Sostituisci "sensor.your_echo_next_timer" con il tuo sensore Alexa reale.
+# ==============================================================================
+
+- id: orologio_led_luminosita_giorno_notte
+  alias: "Orologio LED - Luminosità Automatica Giorno/Notte"
+  description: "Abbassa la luminosità dell'orologio alle 22:00 (8%) e la ripristina alle 07:30 (50%) se è acceso."
+  mode: single
+  triggers:
+    - trigger: time
+      at: "22:00:00"
+      id: notte
+    - trigger: time
+      at: "07:30:00"
+      id: giorno
+  conditions:
+    - condition: state
+      entity_id: light.orologio_7_segmenti_luce_orologio
+      state: "on"
+  actions:
+    - choose:
+        - conditions:
+            - condition: trigger
+              id: notte
+          sequence:
+            - action: light.turn_on
+              target:
+                entity_id: light.orologio_7_segmenti_luce_orologio
+              data:
+                brightness_pct: 8
+        - conditions:
+            - condition: trigger
+              id: giorno
+          sequence:
+            - action: light.turn_on
+              target:
+                entity_id: light.orologio_7_segmenti_luce_orologio
+              data:
+                brightness_pct: 50
+
+- id: orologio_led_sync_timer_alexa
+  alias: "Orologio LED - Sincronizzazione Timer Alexa"
+  description: "Sincronizza il timer dell'orologio con il next_timer di Alexa e torna all'ora dopo la fine o l'annullamento."
+  mode: restart
+  triggers:
+    - trigger: state
+      entity_id: sensor.your_echo_next_timer
+  conditions:
+    - condition: template
+      value_template: >
+        {{ trigger.from_state is none or trigger.to_state.state != trigger.from_state.state }}
+  actions:
+    - choose:
+        # Caso 1: Nuovo timer avviato su Alexa (timestamp futuro valido)
+        - conditions:
+            - condition: template
+              value_template: >
+                {{ states('sensor.your_echo_next_timer') not in ['unavailable', 'unknown', 'none', '']
+                   and (as_timestamp(states('sensor.your_echo_next_timer'), 0) - as_timestamp(now())) > 1 }}
+          sequence:
+            - variables:
+                diff: >
+                  {{ (as_timestamp(states('sensor.your_echo_next_timer'), 0) - as_timestamp(now())) | round(0) | int(0) }}
+                timer_min: "{{ [ (diff // 60) | int, 999 ] | min }}"
+                timer_sec: "{{ (diff % 60) | int }}"
+            - action: number.set_value
+              target:
+                entity_id: number.orologio_7_segmenti_timer_minuti
+              data:
+                value: "{{ timer_min }}"
+            - action: number.set_value
+              target:
+                entity_id: number.orologio_7_segmenti_timer_secondi
+              data:
+                value: "{{ timer_sec }}"
+            - action: button.press
+              target:
+                entity_id: button.orologio_7_segmenti_avvia_timer
+
+        # Caso 2: Timer Alexa terminato o annullato (stato diventa unavailable / unknown / none)
+        - conditions:
+            - condition: template
+              value_template: >
+                {{ trigger.to_state.state in ['unavailable', 'unknown', 'none', ''] }}
+          sequence:
+            - choose:
+                # Se annullato in anticipo (mancavano più di 3 secondi), torna subito all'orologio
+                - conditions:
+                    - condition: template
+                      value_template: >
+                        {{ trigger.from_state is not none
+                           and (as_timestamp(trigger.from_state.state, 0) - as_timestamp(now())) > 3 }}
+                  sequence:
+                    - action: button.press
+                      target:
+                        entity_id: button.orologio_7_segmenti_ferma_timer_sveglia
+              # Altrimenti è scaduto normalmente: lascia lampeggiare 00:00 per 15s poi torna all'orologio
+              default:
+                - delay:
+                    seconds: 15
+                - action: button.press
+                  target:
+                    entity_id: button.orologio_7_segmenti_ferma_timer_sveglia

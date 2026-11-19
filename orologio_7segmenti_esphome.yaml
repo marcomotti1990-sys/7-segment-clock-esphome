@@ -1,0 +1,810 @@
+# ==============================================================================
+# ESPHome Configuration - 7-Segment LED Smart Clock (58 LED WS2812B)
+# Basato su: https://github.com/NimmLor/7-Segement-Clock (clock_mqtt_v2)
+# Hardware: Wemos D1 Mini (ESP8266) - Data Pin: GPIO2 (D4)
+# Mappatura LED originale:
+#   - Digit 1: LED  0..13 (14 LED)
+#   - Digit 2: LED 14..27 (14 LED)
+#   - Dot 2:   LED 28     (Digit3 - 2)
+#   - Dot 1:   LED 29     (Digit3 - 1)
+#   - Digit 3: LED 30..43 (14 LED)
+#   - Digit 4: LED 44..57 (14 LED)
+# ==============================================================================
+
+esphome:
+  name: orologio-led
+  friendly_name: Orologio 7 Segmenti
+  on_boot:
+    priority: -100
+    then:
+      - light.turn_on:
+          id: orologio_light
+          brightness: 40%
+          effect: "Orologio Smart"
+
+esp8266:
+  board: d1_mini
+  restore_from_flash: true
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Hotspot di emergenza nel caso il Wi-Fi non sia raggiungibile
+  ap:
+    ssid: "Orologio-LED Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+# API nativa Home Assistant (sostituisce completamente MQTT e Node-RED)
+api:
+
+ota:
+  - platform: esphome
+
+logger:
+
+web_server:
+  port: 80
+
+# Sincronizzazione orario automatica da Home Assistant (incluso fuso orario / ora legale)
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# Sensore temperatura collegato direttamente a Home Assistant
+# Sostituisci "sensor.your_temperature_sensor" con la tua entità reale
+sensor:
+  - platform: homeassistant
+    id: ha_temp
+    entity_id: sensor.your_temperature_sensor
+    internal: true
+
+# ==============================================================================
+# VARIABILI GLOBALI DI STATO E COLORI SALVATI
+# ==============================================================================
+globals:
+  - id: timer_remaining_sec
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: timer_expired
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: last_clock_sec
+    type: int
+    restore_value: false
+    initial_value: '-1'
+  - id: weather_countdown_sec
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: weather_interval_counter
+    type: int
+    restore_value: false
+    initial_value: '0'
+
+  # Stato macchina a stati per Fade Arcobaleno e Sveglia (ShiftAlarmLeds)
+  - id: fade_phase
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: fade_r
+    type: int
+    restore_value: false
+    initial_value: '255'
+  - id: fade_g
+    type: int
+    restore_value: false
+    initial_value: '255'
+  - id: fade_b
+    type: int
+    restore_value: false
+    initial_value: '255'
+  - id: last_fade_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: alarm_flash_state
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: last_alarm_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  # Colori individuali (RGB packed 0xRRGGBB) per le 4 cifre e i 2 punti
+  - id: d1_rgb
+    type: uint32_t
+    restore_value: true
+    initial_value: '0xFFFFFF'
+  - id: d2_rgb
+    type: uint32_t
+    restore_value: true
+    initial_value: '0xFFFFFF'
+  - id: d3_rgb
+    type: uint32_t
+    restore_value: true
+    initial_value: '0xFFFFFF'
+  - id: d4_rgb
+    type: uint32_t
+    restore_value: true
+    initial_value: '0xFFFFFF'
+  - id: dot1_rgb
+    type: uint32_t
+    restore_value: true
+    initial_value: '0xFFFFFF'
+  - id: dot2_rgb
+    type: uint32_t
+    restore_value: true
+    initial_value: '0xFFFFFF'
+
+# ==============================================================================
+# SELETTORI (MODALITÀ E BERSAGLIO COLORE PER CIFRE/PUNTI SINGOLI)
+# ==============================================================================
+select:
+  - platform: template
+    name: "Modalità"
+    id: clock_mode
+    icon: "mdi:clock-digital"
+    options:
+      - "Orologio"
+      - "Temperatura"
+      - "Timer"
+      - "Numeri Personalizzati"
+      - "Sveglia"
+    initial_option: "Orologio"
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - lambda: |-
+            auto idx = id(clock_mode).active_index().value_or(0);
+            if (idx != 2) {
+              id(timer_expired) = false;
+            }
+            if (idx != 0) {
+              id(weather_countdown_sec) = 0;
+            }
+
+  - platform: template
+    name: "Bersaglio Colore"
+    id: color_target
+    icon: "mdi:eyedropper"
+    options:
+      - "Tutti (Colore Unico)"
+      - "Cifra 1"
+      - "Cifra 2"
+      - "Cifra 3"
+      - "Cifra 4"
+      - "Punto 1"
+      - "Punto 2"
+      - "Mantieni Colori Singoli"
+    initial_option: "Tutti (Colore Unico)"
+    optimistic: true
+    restore_value: true
+
+# ==============================================================================
+# INTERRUTTORI (PUNTI, FADE, METEO AUTOMATICO)
+# ==============================================================================
+switch:
+  - platform: template
+    name: "Punto 1"
+    id: sw_dot1
+    icon: "mdi:circle-small"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    name: "Punto 2"
+    id: sw_dot2
+    icon: "mdi:circle-small"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    name: "Lampeggio Punti"
+    id: sw_blink_dots
+    icon: "mdi:dots-vertical"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    name: "Fade Arcobaleno"
+    id: sw_fade
+    icon: "mdi:looks"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: template
+    name: "Mostra Temperatura Periodica"
+    id: sw_auto_weather
+    icon: "mdi:thermometer-auto"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    name: "Colore Automatico Temperatura"
+    id: sw_weather_autocolor
+    icon: "mdi:palette-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# ==============================================================================
+# CONTROLLI NUMERICI (FADE, TEMPERATURA, TIMER, CIFRE PERSONALIZZATE)
+# ==============================================================================
+number:
+  - platform: template
+    name: "Velocità Fade"
+    id: num_fade_speed
+    icon: "mdi:speedometer"
+    min_value: 0
+    max_value: 9
+    step: 1
+    initial_value: 3
+    mode: slider
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Durata Display Temperatura"
+    id: num_weather_duration
+    icon: "mdi:timer-sand"
+    unit_of_measurement: "s"
+    min_value: 2
+    max_value: 99
+    step: 1
+    initial_value: 10
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Intervallo Temperatura"
+    id: num_weather_interval
+    icon: "mdi:clock-time-four-outline"
+    unit_of_measurement: "min"
+    min_value: 1
+    max_value: 120
+    step: 1
+    initial_value: 30
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Timer Minuti"
+    id: num_timer_min
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "min"
+    min_value: 0
+    max_value: 999
+    step: 1
+    initial_value: 5
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Timer Secondi"
+    id: num_timer_sec
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 59
+    step: 1
+    initial_value: 0
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Cifra 1"
+    id: num_digit1
+    icon: "mdi:numeric-1-box-outline"
+    min_value: -1
+    max_value: 9
+    step: 1
+    initial_value: 0
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Cifra 2"
+    id: num_digit2
+    icon: "mdi:numeric-2-box-outline"
+    min_value: -1
+    max_value: 9
+    step: 1
+    initial_value: 0
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Cifra 3"
+    id: num_digit3
+    icon: "mdi:numeric-3-box-outline"
+    min_value: -1
+    max_value: 9
+    step: 1
+    initial_value: 0
+    mode: box
+    optimistic: true
+    restore_value: true
+
+  - platform: template
+    name: "Cifra 4"
+    id: num_digit4
+    icon: "mdi:numeric-4-box-outline"
+    min_value: -1
+    max_value: 9
+    step: 1
+    initial_value: 0
+    mode: box
+    optimistic: true
+    restore_value: true
+
+# ==============================================================================
+# PULSANTI AZIONE (TEMPERATURA, AVVIA TIMER, FERMA TIMER / SVEGLIA)
+# ==============================================================================
+button:
+  - platform: template
+    name: "Mostra Temperatura Ora"
+    id: btn_show_weather
+    icon: "mdi:thermometer"
+    on_press:
+      - if:
+          condition:
+            light.is_off: orologio_light
+          then:
+            - light.turn_on:
+                id: orologio_light
+                brightness: 40%
+                effect: "Orologio Smart"
+      - lambda: |-
+          auto mode_idx = id(clock_mode).active_index().value_or(0);
+          if (mode_idx != 0 && mode_idx != 1) {
+            auto call = id(clock_mode).make_call();
+            call.set_option("Orologio");
+            call.perform();
+          }
+          id(weather_interval_counter) = 0;
+          id(weather_countdown_sec) = (int) id(num_weather_duration).state;
+
+  - platform: template
+    name: "Avvia Timer"
+    id: btn_start_timer
+    icon: "mdi:timer-play"
+    on_press:
+      - if:
+          condition:
+            light.is_off: orologio_light
+          then:
+            - light.turn_on:
+                id: orologio_light
+                brightness: 40%
+                effect: "Orologio Smart"
+      - switch.turn_on: sw_dot1
+      - switch.turn_on: sw_dot2
+      - lambda: |-
+          int total = (int) id(num_timer_min).state * 60 + (int) id(num_timer_sec).state;
+          id(timer_remaining_sec) = total;
+          id(timer_expired) = (total <= 0);
+          id(weather_countdown_sec) = 0;
+      - select.set:
+          id: clock_mode
+          option: "Timer"
+
+  - platform: template
+    name: "Ferma Timer / Sveglia"
+    id: btn_stop_alarm
+    icon: "mdi:alarm-off"
+    on_press:
+      - lambda: |-
+          id(timer_expired) = false;
+          id(timer_remaining_sec) = 0;
+          id(alarm_flash_state) = false;
+      - select.set:
+          id: clock_mode
+          option: "Orologio"
+
+# ==============================================================================
+# LOOP 1 SECONDO (EFFETTO ATTIVO, COUNTDOWN TIMER, METEO PERIODICO)
+# ==============================================================================
+interval:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(orologio_light).current_values.is_on() && id(orologio_light).get_effect_name() == "None";
+          then:
+            - light.turn_on:
+                id: orologio_light
+                effect: "Orologio Smart"
+      - lambda: |-
+          auto mode_idx = id(clock_mode).active_index().value_or(0);
+
+          // 1. Gestione countdown Timer (Modalità 2 = "Timer")
+          if (mode_idx == 2) {
+            if (id(timer_remaining_sec) > 0) {
+              id(timer_remaining_sec) -= 1;
+              if (id(timer_remaining_sec) == 0) {
+                id(timer_expired) = true;
+              }
+            }
+          } else {
+            id(timer_expired) = false;
+          }
+
+          // 2. Gestione visualizzazione periodica temperatura in modalità Orologio
+          if (id(weather_countdown_sec) > 0) {
+            id(weather_countdown_sec) -= 1;
+          } else if (mode_idx == 0 && id(sw_auto_weather).state) {
+            id(weather_interval_counter) += 1;
+            int interval_sec = (int) id(num_weather_interval).state * 60;
+            if (interval_sec > 0 && id(weather_interval_counter) >= interval_sec) {
+              id(weather_interval_counter) = 0;
+              if (id(ha_temp).has_state() && !std::isnan(id(ha_temp).state)) {
+                id(weather_countdown_sec) = (int) id(num_weather_duration).state;
+              }
+            }
+          } else {
+            id(weather_interval_counter) = 0;
+          }
+
+# ==============================================================================
+# STRISCIA LED WS2812B (58 LED SU GPIO2 / D4) + LOGICA DISPLAY 7-SEGMENTI
+# ==============================================================================
+light:
+  - platform: neopixelbus
+    id: orologio_light
+    name: "Luce Orologio"
+    type: GRB
+    variant: WS2812
+    pin: GPIO2
+    method: ESP8266_UART1
+    num_leds: 58
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_ON
+    effects:
+      - addressable_lambda:
+          name: "Orologio Smart"
+          update_interval: 50ms
+          lambda: |-
+            // Helper: ShiftAlarmLeds identico a clock_mqtt_v2 vers.2.ino
+            auto shift_alarm_leds = [&](int amount) {
+              int cur_phase = id(fade_phase);
+              int cur_r = id(fade_r);
+              int cur_g = id(fade_g);
+              int cur_b = id(fade_b);
+
+              if (cur_phase == 0) {
+                cur_g -= amount;
+                cur_b -= amount;
+                if (cur_g <= 0 && cur_b <= 0) cur_phase++;
+                if (cur_g < 0) cur_g = 0;
+                if (cur_b < 0) cur_b = 0;
+              } else if (cur_phase == 1) {
+                cur_g += amount;
+                if (cur_g >= 255) { cur_g = 255; cur_phase++; }
+              } else if (cur_phase == 2) {
+                cur_r -= amount;
+                if (cur_r <= 0) { cur_r = 0; cur_phase++; }
+              } else if (cur_phase == 3) {
+                cur_b += amount;
+                if (cur_b >= 255) { cur_b = 255; cur_phase++; }
+              } else if (cur_phase == 4) {
+                cur_g -= amount;
+                if (cur_g <= 0) { cur_g = 0; cur_phase++; }
+              } else if (cur_phase == 5) {
+                cur_r += amount;
+                if (cur_r >= 255) { cur_r = 255; cur_phase++; }
+              } else if (cur_phase == 6) {
+                cur_b -= amount;
+                if (cur_b <= 0) { cur_b = 0; cur_phase++; }
+              } else if (cur_phase == 7) {
+                cur_b += amount;
+                cur_g += amount;
+                if (cur_b >= 255) { cur_b = 255; cur_g = 255; cur_phase = 0; }
+                if (cur_g > 255) cur_g = 255;
+              }
+
+              id(fade_phase) = cur_phase;
+              id(fade_r) = cur_r;
+              id(fade_g) = cur_g;
+              id(fade_b) = cur_b;
+            };
+
+            // Helper: DrawDigit (n = 0..9, oppure n = 10 per segno '-')
+            auto draw_digit = [&](int offset, Color c, int n) {
+              if (n < 0 || n > 10) return;
+
+              // MIDDLE (0, 1)
+              if (n == 2 || n == 3 || n == 4 || n == 5 || n == 6 || n == 8 || n == 9 || n == 10) {
+                it[offset + 0] = c;
+                it[offset + 1] = c;
+              }
+              // TOP RIGHT (2, 3)
+              if (n == 0 || n == 1 || n == 2 || n == 3 || n == 4 || n == 7 || n == 8 || n == 9) {
+                it[offset + 2] = c;
+                it[offset + 3] = c;
+              }
+              // TOP (4, 5)
+              if (n == 0 || n == 2 || n == 3 || n == 5 || n == 6 || n == 7 || n == 8 || n == 9) {
+                it[offset + 4] = c;
+                it[offset + 5] = c;
+              }
+              // TOP LEFT (6, 7)
+              if (n == 0 || n == 4 || n == 5 || n == 6 || n == 8 || n == 9) {
+                it[offset + 6] = c;
+                it[offset + 7] = c;
+              }
+              // BOTTOM LEFT (8, 9)
+              if (n == 0 || n == 2 || n == 6 || n == 8) {
+                it[offset + 8] = c;
+                it[offset + 9] = c;
+              }
+              // BOTTOM (10, 11)
+              if (n == 0 || n == 2 || n == 3 || n == 5 || n == 6 || n == 8 || n == 9) {
+                it[offset + 10] = c;
+                it[offset + 11] = c;
+              }
+              // BOTTOM RIGHT (12, 13)
+              if (n == 0 || n == 1 || n == 3 || n == 4 || n == 5 || n == 6 || n == 7 || n == 8 || n == 9) {
+                it[offset + 12] = c;
+                it[offset + 13] = c;
+              }
+            };
+
+            // Helper: DrawDots (LED 29 = Dot1, LED 28 = Dot2)
+            auto draw_dots = [&](Color c1, Color c2, bool blink_off) {
+              if (!blink_off && id(sw_dot1).state) {
+                it[29] = c1;
+              }
+              if (!blink_off && id(sw_dot2).state) {
+                it[28] = c2;
+              }
+            };
+
+            // Helper: GetWeatherColor(temp)
+            auto get_weather_color = [&](int temp) -> Color {
+              if (temp < -40) return Color(0, 197, 229);
+              if (temp < -30) return Color(28, 203, 204);
+              if (temp < -20) return Color(56, 209, 180);
+              if (temp < -10) return Color(84, 216, 156);
+              if (temp < 0)   return Color(112, 222, 131);
+              if (temp < 4)   return Color(140, 229, 107);
+              if (temp < 8)   return Color(168, 235, 83);
+              if (temp < 14)  return Color(196, 242, 58);
+              if (temp < 18)  return Color(224, 248, 34);
+              if (temp < 22)  return Color(253, 244, 10);
+              if (temp < 26)  return Color(253, 233, 10);
+              if (temp < 30)  return Color(254, 142, 10);
+              if (temp < 34)  return Color(254, 105, 10);
+              return Color(255, 68, 10);
+            };
+
+            // Helper: Temperatura con simbolo °C (Digit3 30..37, Digit4 48..55 in ciano)
+            auto draw_weather = [&](Color c1, Color c2) {
+              const Color sym_color(61, 225, 255);
+              for (int i = 30; i <= 37; i++) it[i] = sym_color;
+              for (int i = 48; i <= 55; i++) it[i] = sym_color;
+
+              if (!id(ha_temp).has_state() || std::isnan(id(ha_temp).state)) {
+                draw_digit(0, c1, 10);
+                draw_digit(14, c2, 10);
+                return;
+              }
+
+              int temp = (int) roundf(id(ha_temp).state);
+              Color col1 = id(sw_weather_autocolor).state ? get_weather_color(temp) : c1;
+              Color col2 = id(sw_weather_autocolor).state ? col1 : c2;
+
+              if (temp >= 0) {
+                int clamped = temp > 99 ? 99 : temp;
+                int t1 = clamped / 10;
+                int t2 = clamped % 10;
+                if (t1 != 0) {
+                  draw_digit(0, col1, t1);
+                }
+                draw_digit(14, col2, t2);
+              } else if (temp > -10) {
+                // Temperature negative da -1 a -9: segno '-' su Digit1 (LED 0,1) e cifra su Digit2
+                draw_digit(0, col1, 10);
+                draw_digit(14, col2, (-temp) % 10);
+              } else {
+                int abs_t = -temp;
+                if (abs_t > 99) abs_t = 99;
+                draw_digit(0, col1, abs_t / 10);
+                draw_digit(14, col2, abs_t % 10);
+              }
+            };
+
+            uint32_t now_ms = millis();
+            if (initial_run) {
+              id(last_fade_ms) = now_ms;
+              id(last_alarm_ms) = now_ms;
+            }
+
+            // Pulizia buffer ad ogni frame
+            it.all() = Color::BLACK;
+
+            // Aggiorna colore Fade se attivo (SetFadeSpeed da 0 a 9)
+            Color active_color = current_color;
+            if (id(sw_fade).state) {
+              int spd = (int) id(num_fade_speed).state;
+              int fade_amount = 1;
+              uint32_t fade_delay = 100;
+              switch (spd) {
+                case 0: fade_amount = 1;  fade_delay = 1000; break;
+                case 1: fade_amount = 1;  fade_delay = 500;  break;
+                case 2: fade_amount = 1;  fade_delay = 250;  break;
+                case 3: fade_amount = 1;  fade_delay = 100;  break;
+                case 4: fade_amount = 1;  fade_delay = 25;   break;
+                case 5: fade_amount = 2;  fade_delay = 25;   break;
+                case 6: fade_amount = 2;  fade_delay = 0;    break;
+                case 7: fade_amount = 3;  fade_delay = 0;    break;
+                case 8: fade_amount = 4;  fade_delay = 0;    break;
+                case 9: fade_amount = 12; fade_delay = 0;    break;
+                default: fade_amount = 1; fade_delay = 25;   break;
+              }
+              if ((uint32_t)(now_ms - id(last_fade_ms)) >= fade_delay) {
+                id(last_fade_ms) = now_ms;
+                shift_alarm_leds(fade_amount);
+              }
+              active_color = Color(id(fade_r), id(fade_g), id(fade_b));
+            }
+
+            // Aggiorna i colori individuali o globali in base a "Bersaglio Colore"
+            uint32_t packed_cur = ((uint32_t) current_color.r << 16) |
+                                  ((uint32_t) current_color.g << 8) |
+                                  (uint32_t) current_color.b;
+            auto target_idx = id(color_target).active_index().value_or(0);
+            if (target_idx == 0) {
+              id(d1_rgb) = packed_cur;
+              id(d2_rgb) = packed_cur;
+              id(d3_rgb) = packed_cur;
+              id(d4_rgb) = packed_cur;
+              id(dot1_rgb) = packed_cur;
+              id(dot2_rgb) = packed_cur;
+            } else if (target_idx == 1) {
+              id(d1_rgb) = packed_cur;
+            } else if (target_idx == 2) {
+              id(d2_rgb) = packed_cur;
+            } else if (target_idx == 3) {
+              id(d3_rgb) = packed_cur;
+            } else if (target_idx == 4) {
+              id(d4_rgb) = packed_cur;
+            } else if (target_idx == 5) {
+              id(dot1_rgb) = packed_cur;
+            } else if (target_idx == 6) {
+              id(dot2_rgb) = packed_cur;
+            }
+
+            auto unpack_color = [&](uint32_t v) -> Color {
+              if (id(sw_fade).state) return active_color;
+              return Color((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+            };
+
+            Color c_d1 = unpack_color(id(d1_rgb));
+            Color c_d2 = unpack_color(id(d2_rgb));
+            Color c_d3 = unpack_color(id(d3_rgb));
+            Color c_d4 = unpack_color(id(d4_rgb));
+            Color c_dot1 = unpack_color(id(dot1_rgb));
+            Color c_dot2 = unpack_color(id(dot2_rgb));
+
+            auto mode_idx = id(clock_mode).active_index().value_or(0);
+            auto now = id(ha_time).now();
+            if (now.is_valid()) {
+              id(last_clock_sec) = now.second;
+            }
+
+            // 1. Sveglia (mode_idx == 4) o Timer scaduto (mode_idx == 2 && timer_expired)
+            if (mode_idx == 4 || (mode_idx == 2 && id(timer_expired))) {
+              if (id(alarm_flash_state)) {
+                if ((uint32_t)(now_ms - id(last_alarm_ms)) >= 350) {
+                  id(last_alarm_ms) = now_ms;
+                  id(alarm_flash_state) = false;
+                }
+              } else {
+                if ((uint32_t)(now_ms - id(last_alarm_ms)) >= 100) {
+                  id(last_alarm_ms) = now_ms;
+                  id(alarm_flash_state) = true;
+                  shift_alarm_leds(51);
+                }
+              }
+
+              if (id(alarm_flash_state)) {
+                Color alarm_col(id(fade_r), id(fade_g), id(fade_b));
+                if (mode_idx == 2) {
+                  // Timer Scaduto: lampeggia 00:00 con punti
+                  draw_digit(0, alarm_col, 0);
+                  draw_digit(14, alarm_col, 0);
+                  it[28] = alarm_col;
+                  it[29] = alarm_col;
+                  draw_digit(30, alarm_col, 0);
+                  draw_digit(44, alarm_col, 0);
+                } else {
+                  // Sveglia: lampeggia ora corrente
+                  if (now.is_valid()) {
+                    draw_digit(0, alarm_col, now.hour / 10);
+                    draw_digit(14, alarm_col, now.hour % 10);
+                    draw_digit(30, alarm_col, now.minute / 10);
+                    draw_digit(44, alarm_col, now.minute % 10);
+                  } else {
+                    draw_digit(0, alarm_col, 0);
+                    draw_digit(14, alarm_col, 0);
+                    draw_digit(30, alarm_col, 0);
+                    draw_digit(44, alarm_col, 0);
+                  }
+                }
+              }
+              return;
+            }
+
+            // 2. Temperatura (selezionata o overlay periodico durante Orologio)
+            if (mode_idx == 1 || (mode_idx == 0 && id(weather_countdown_sec) > 0)) {
+              draw_weather(c_d1, c_d2);
+              return;
+            }
+
+            // 3. Timer in corso (mode_idx == 2)
+            if (mode_idx == 2) {
+              int rem = id(timer_remaining_sec);
+              if (rem < 0) rem = 0;
+              int t_hours = rem / 3600;
+              int t_mins = (rem % 3600) / 60;
+              int t_secs = rem % 60;
+
+              if (t_hours > 0) {
+                int h_clamp = t_hours > 99 ? 99 : t_hours;
+                draw_digit(0, c_d1, h_clamp / 10);
+                draw_digit(14, c_d2, h_clamp % 10);
+                draw_digit(30, c_d3, t_mins / 10);
+                draw_digit(44, c_d4, t_mins % 10);
+              } else {
+                draw_digit(0, c_d1, t_mins / 10);
+                draw_digit(14, c_d2, t_mins % 10);
+                draw_digit(30, c_d3, t_secs / 10);
+                draw_digit(44, c_d4, t_secs % 10);
+              }
+              draw_dots(c_dot1, c_dot2, false);
+              return;
+            }
+
+            // 4. Numeri Personalizzati (mode_idx == 3)
+            if (mode_idx == 3) {
+              int d1 = (int) id(num_digit1).state;
+              int d2 = (int) id(num_digit2).state;
+              int d3 = (int) id(num_digit3).state;
+              int d4 = (int) id(num_digit4).state;
+              if (d1 >= 0 && d1 <= 9) draw_digit(0, c_d1, d1);
+              if (d2 >= 0 && d2 <= 9) draw_digit(14, c_d2, d2);
+              if (d3 >= 0 && d3 <= 9) draw_digit(30, c_d3, d3);
+              if (d4 >= 0 && d4 <= 9) draw_digit(44, c_d4, d4);
+              draw_dots(c_dot1, c_dot2, false);
+              return;
+            }
+
+            // 5. Orologio (mode_idx == 0, default)
+            if (now.is_valid()) {
+              draw_digit(0, c_d1, now.hour / 10);
+              draw_digit(14, c_d2, now.hour % 10);
+              draw_digit(30, c_d3, now.minute / 10);
+              draw_digit(44, c_d4, now.minute % 10);
+              bool blink_off = id(sw_blink_dots).state && (now.second % 2 != 0);
+              draw_dots(c_dot1, c_dot2, blink_off);
+            } else {
+              // In attesa di sincronizzazione orario da Home Assistant: mostra "--:--"
+              draw_digit(0, c_d1, 10);
+              draw_digit(14, c_d2, 10);
+              draw_digit(30, c_d3, 10);
+              draw_digit(44, c_d4, 10);
+              draw_dots(c_dot1, c_dot2, false);
+            }
